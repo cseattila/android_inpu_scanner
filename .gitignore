@@ -1,0 +1,8 @@
+# Compiled objects and libraries
+*.o
+*.a
+*.so
+
+# Build output
+/ir-reader
+/build/
