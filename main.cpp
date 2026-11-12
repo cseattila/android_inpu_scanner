@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cerrno>
 #include <cstring>
+#include <chrono>
 #include <fcntl.h>
 #include <poll.h>
 #include <string>
@@ -13,6 +14,8 @@
 
 static constexpr unsigned short SERVER_PORT = 6123;
 static constexpr size_t MAX_PENDING_BYTES = 64 * 1024;
+static constexpr auto HEARTBEAT_INTERVAL = std::chrono::seconds(5);
+static constexpr char HEARTBEAT_LINE[] = "PING\n";
 
 struct Client {
     int fd;
@@ -126,6 +129,7 @@ int main(int argc, char* argv[])
     std::fflush(stdout);
 
     std::vector<Client> clients;
+    auto next_heartbeat = std::chrono::steady_clock::now() + HEARTBEAT_INTERVAL;
 
     while (true) {
         std::vector<pollfd> poll_fds;
@@ -139,7 +143,12 @@ int main(int argc, char* argv[])
             poll_fds.push_back({client.fd, events, 0});
         }
 
-        int ready = poll(poll_fds.data(), poll_fds.size(), -1);
+        const auto now = std::chrono::steady_clock::now();
+        const auto heartbeat_wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+            next_heartbeat - now
+        ).count();
+        const int poll_timeout = static_cast<int>(heartbeat_wait > 0 ? heartbeat_wait : 0);
+        int ready = poll(poll_fds.data(), poll_fds.size(), poll_timeout);
         if (ready < 0) {
             if (errno == EINTR)
                 continue;
@@ -150,6 +159,29 @@ int main(int argc, char* argv[])
 
         const size_t existing_clients = clients.size();
         std::vector<bool> disconnect(existing_clients, false);
+
+        if (std::chrono::steady_clock::now() >= next_heartbeat) {
+            const std::string heartbeat(HEARTBEAT_LINE);
+            for (size_t i = 0; i < clients.size(); ++i) {
+                Client& client = clients[i];
+                const size_t queued = client.pending.size() - client.sent;
+                if (queued + heartbeat.size() > MAX_PENDING_BYTES) {
+                    if (i < existing_clients) {
+                        disconnect[i] = true;
+                    } else {
+                        close(client.fd);
+                        client.fd = -1;
+                    }
+                    continue;
+                }
+                if (client.sent == client.pending.size()) {
+                    client.pending.clear();
+                    client.sent = 0;
+                }
+                client.pending += heartbeat;
+            }
+            next_heartbeat = std::chrono::steady_clock::now() + HEARTBEAT_INTERVAL;
+        }
 
         if (poll_fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             std::fprintf(stderr, "Input device is no longer available\n");
